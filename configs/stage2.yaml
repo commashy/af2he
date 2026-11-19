@@ -1,0 +1,68 @@
+name: af2he_stage2
+# Stage-1 generator from pretrain/last.pt. Input is native AF.
+# Hematoxylin and eosin reconstruction against epoch 10. Weight 3.
+# Blur across the five epochs is 0, 2, 4, 8, 16.
+# Four-scale PatchGAN, scales summed. CUT PatchNCE keeps AF structure. No slide conditioning.
+af_root: /mnt/10tb_hdd/taek/images/Fresh_section/patches_1024/trainA
+he_root: /mnt/10tb_hdd/taek/images/Fresh_section/patches_1024/trainB
+alignment: /mnt/10tb_hdd/taek/af2he/manifests/pseudo_alignment.csv
+exclude_slides: /mnt/10tb_hdd/taek/stain_translation_enco/configs/exclude_fresh_poor_pairs.txt
+extra_slides: /mnt/10tb_hdd/taek/af2he/expand/slides.txt
+collage_index: /mnt/10tb_hdd/taek/af2he/collages/index.json
+collage_size: 1024
+pretrain_checkpoint: /mnt/10tb_hdd/taek/af2he/checkpoints/pretrain/last.pt
+compile: false
+compile_mode: default
+checkpoint_dir: /mnt/10tb_hdd/taek/af2he/checkpoints/stage2_af
+
+batch_size: 4
+num_workers: 4
+n_epochs: 5
+n_epochs_decay: 0
+recon_weight_schedule: [3, 3, 3, 3, 3]
+recon_sigma_schedule: [0, 2, 4, 8, 16]
+lambda_recon: 2.0
+recon_sigma: 4
+recon_hed: true
+recon_eosin_only: false
+recon_tissue_only: false
+recon_full_epochs: 5
+load_teacher: false
+epoch10_dir: /mnt/10tb_hdd/taek/af2he/e10_overlap
+lambda_overlap: 1.0
+lr_G: 0.00005
+lr_D: 0.0001
+lr_F: 0.00005
+beta1: 0.5
+beta2: 0.999
+samples_per_epoch: all
+seed: 0
+log_every: 20
+image_every: 100
+wandb: false
+monitor: local
+monitor_dir: /mnt/10tb_hdd/taek/af2he/swanlog
+wandb_project: af2he
+
+lambda_mb: 0.1
+slide_labels: /mnt/10tb_hdd/taek/stain_translation_core/manifests/fresh/train_slide_labels.csv
+
+# CUT PatchNCE. Weight 0.2. Chance is about 1.11.
+lambda_NCE: 0.2
+# AF gray >= 0.60 must keep light stain. The penalty stops at optical density 0.35.
+lambda_keep: 1.0
+nce_T: 0.07
+nce_layers: [2, 3, 4]
+num_patches: 256
+
+lambda_GAN: 1.0
+netD_num_scales: 4
+
+lambda_FDL: 0.003
+fdl_input_size: 512
+# Gate the whole frequency loss. Similar tissue amount keeps it; a mismatch drops it.
+fdl_phase_weight: 1.0
+fdl_num_proj: 256
+heat_targets: /mnt/10tb_hdd/taek/af2he/manifests/heat_patch_targets.csv
+malignancy_checkpoint: /mnt/10tb_hdd/taek/af2he/checkpoints/heat_classifier/best.pt
+lambda_heat: 0.1

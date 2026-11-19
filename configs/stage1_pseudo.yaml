@@ -1,0 +1,100 @@
+name: af2he_stage1_e11
+# 331 batch-1 slides with use=crop_absolute. Launch only after pseudo extraction
+# has written every one of those patches.
+af_root: /mnt/10tb_hdd/taek/images/Fresh_section/patches_1024/trainA
+pseudo_root: /mnt/10tb_hdd/taek/images/Fresh_section/patches_1024/pseudo
+he_root: /mnt/10tb_hdd/taek/images/Fresh_section/patches_1024/trainB
+alignment: /mnt/10tb_hdd/taek/af2he/manifests/pseudo_alignment.csv
+# Accession blocklist. crop_absolute slides on this list are left out.
+exclude_slides: /mnt/10tb_hdd/taek/stain_translation_enco/configs/exclude_fresh_poor_pairs.txt
+# The 123 added slides are not crop_absolute. Full slide ids, one per line.
+extra_slides: /mnt/10tb_hdd/taek/af2he/expand/slides.txt
+collage_index: /mnt/10tb_hdd/taek/af2he/collages/index.json
+pretrain_checkpoint: /mnt/10tb_hdd/taek/af2he/checkpoints/pretrain/epoch_0005.pt
+# Left off. Inductor is not the eager bf16 step, and this GAN diverged:
+# by step ~4400 the discriminator loss sat near 0 and the generator term near 1.
+compile: false
+compile_mode: default
+checkpoint_dir: /mnt/10tb_hdd/taek/af2he/checkpoints/stage1
+
+# Four 512 quadrants of one 1024 field per GPU. The discriminator and FDL
+# see that field stitched back to 1024.
+batch_size: 4
+num_workers: 4
+# Resume displayed epoch 11 from epoch_0010.pt.
+# Same stack as epoch 10. Discriminator classification weight is 0.1.
+# Overlap stays the uniform mean. Stops when epoch 11 saves.
+n_epochs: 11
+n_epochs_decay: 0
+recon_full_epochs: 11
+teacher_dir: /mnt/10tb_hdd/taek/af2he/teacher_cache
+load_teacher: true
+lambda_recon: 0.2
+lambda_occupancy: 0.0
+occupancy_sigma: 16
+recon_sigma: 8
+# On top of the uniform loss. AF gray 0.20 stays at 1; gray 0.30 and above is 3.
+recon_bright_lo: 0.20
+recon_bright_hi: 0.30
+recon_bright_gain: 3.0
+# Seam-centered 512s, generated one at a time without gradient. On for all epochs.
+lambda_overlap: 1.0
+# Fresh PLG finetune rates. Generator and projector are slower than the
+# discriminator. No gradient clip and no R1/R2: those runs used spectral
+# norm on the discriminator and left both penalties at 0.
+lr_G: 0.00005
+lr_D: 0.0001
+lr_F: 0.00005
+beta1: 0.5
+beta2: 0.999
+samples_per_epoch: all
+seed: 0
+log_every: 20
+image_every: 200
+wandb: true
+wandb_project: af2he
+
+# MDCL: fake query, AF key. Same-location positive, other AF patches and
+# other fake patches as negatives. HDCE/SRC are not used.
+lambda_NCE: 1.0
+# Field InfoNCE. Query is UNI of the generated 1024, in float16, outside the
+# generator bfloat16 block. Keys are the stored retrieval embeddings.
+# Weight 0.1. The raw UNI gradient is about 8–25 times the GAN gradient,
+# so this weight puts the UNI step next to the GAN step.
+lambda_uni: 0.0
+uni_T: 0.07
+# Stored teacher-to-retrieved-H&E cosine. 0.3 and below drops the field.
+# 0.6 and above keeps the full weight. This is not the live query cosine.
+uni_cosine_lo: 0.3
+uni_cosine_hi: 0.6
+retrieval_dir: /mnt/10tb_hdd/taek/af2he/retrieval
+# Benign/malignant head on the collage class token that FiLM uses.
+# Same weight the previous WSI label used. Subtype is not trained.
+lambda_mb: 0.1
+slide_labels: /mnt/10tb_hdd/taek/stain_translation_core/manifests/fresh/train_slide_labels.csv
+nce_T: 0.07
+nce_layers: [2, 3, 4]
+# BCI uses 256 patches on a 512 crop. Our NCE maps are 256, 128, and 64,
+# so 512 samples the larger maps more densely.
+num_patches: 512
+
+# 3-scale LSGAN on the stitched 1024 field. Slide FiLM is off.
+# Real is the same-coordinate H&E, flipped with the AF. Not a pixel target.
+# The extra head predicts the slide. There is no fake class.
+# Discriminator head weight 0.1 keeps it auxiliary. Generator stays at 0.05.
+lambda_GAN: 1.0
+netD_num_scales: 3
+d_slide_cond: false
+d_slide_cls: true
+lambda_d_cls: 0.1
+lambda_g_cls: 0.05
+d_slide_background: 0.15
+
+# FDL on the 1024 field, resized to 512. Phase weight 1.
+# The real field is the same paired H&E. The gate is how close its tissue
+# fraction is to the pseudo label, so a glass section does not pull a tissue field.
+# Epoch 7 weight. At 0.002 the logged term already sat near GAN.
+lambda_FDL: 0.003
+fdl_input_size: 512
+fdl_phase_weight: 1.0
+fdl_num_proj: 256

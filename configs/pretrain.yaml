@@ -1,0 +1,49 @@
+name: af2he_pretrain
+# H&E tiles only. Each one still uses that slide's AF collage.
+# Poor H&E, missing H&E, and improper fixation are removed. Other organs and
+# unknown labels are removed too. The October checkpoints stay in checkpoints/pretrain.
+data_roots:
+  - /mnt/10tb_hdd/taek/images/Fresh_section/patches_1024/trainB
+collage_dir: /mnt/10tb_hdd/taek/af2he/collages
+collage_index: /mnt/10tb_hdd/taek/af2he/collages/index.json
+collage_root: /mnt/10tb_hdd/taek/af2he/collages_grid/train
+wsi_encoder: /mnt/10tb_hdd/taek/af2he/checkpoints/wsi_collage_encoder/epoch_0100.pt
+lambda_class: 1.0
+lambda_subtype: 0.5
+exclude_slides: /mnt/10tb_hdd/taek/stain_translation_enco/configs/exclude_fresh_poor_pairs.txt
+exclude_reasons:
+  - missing he
+  - poor he
+  - improper fixation
+  - unknown
+  - lymph node
+  - breast
+  - thyroid
+# Images per GPU. Each 1024 file supplies its four 512 quadrants, so the
+# loader reads batch_size/4 patch files and the same number of collages.
+# Three 2048 collages per GPU. Batch 16 compiled L1 filled the 24 GB cards.
+batch_size: 12
+num_workers: 4
+epochs: 30
+lr: 0.0001
+weight_decay: 0.05
+# One pass over every AF and H&E tile. The loader drops a partial last batch.
+samples_per_epoch: all
+wandb: false
+monitor: local
+monitor_dir: /mnt/10tb_hdd/taek/af2he/swanlog
+wandb_project: af2he
+mask_patch: 64
+mask_fraction: 0.4
+# Compiled while there is no discriminator. Compile stays off only if lambda_GAN > 0.
+compile: true
+compile_mode: default
+# Freeze the collage encoder after epoch 1. L1 only from here; no PatchGAN, no LPIPS.
+gan_after_epoch1: true
+perceptual_weight: 0.0
+lambda_GAN: 0.0
+disc_lr: 0.0002
+checkpoint_dir: /mnt/10tb_hdd/taek/af2he/checkpoints/pretrain_qc
+seed: 0
+log_every: 20
+image_every: 100
