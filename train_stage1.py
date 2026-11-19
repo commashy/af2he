@@ -655,7 +655,10 @@ def main() -> None:
                 dtype=torch.float32,
                 device=device,
             )
-            slide_head = SlideDiagnosisHead(BOTTLENECK_DIM).to(device)
+            if use_mb:
+                slide_head = SlideDiagnosisHead(BOTTLENECK_DIM).to(device)
+        if use_ot and diagnosis is None:
+            diagnosis = _diagnosis_table(label_path)
         if slide_head is not None and payload is not None and payload.get("slide_head"):
             slide_head.load_state_dict(payload["slide_head"])
         if slide_head is not None and ctx.distributed:
@@ -955,7 +958,8 @@ def main() -> None:
             epoch10_out = (
                 batch["epoch10"].to(device, non_blocking=True)
                 if "epoch10" in batch and (
-                    need_teacher or use_fdl or use_ot or use_occupancy or use_polarity
+                    need_teacher or use_fdl or use_ot or recon_weight > 0
+                    or use_occupancy or use_polarity
                     or field_d is not None
                 )
                 else None
@@ -1375,7 +1379,12 @@ def main() -> None:
                 heat_keep = None
             loss_g = sum(scaled.values())
             if ot_grad is not None:
-                loss_g = loss_g + (fake_field.float() * ot_grad.float()).sum()
+                # The dot product carries the gradient. Its value is not the loss,
+                # so the logged total uses the set-match loss itself.
+                ot_surrogate = (fake_field.float() * ot_grad.float()).sum()
+                loss_g = loss_g + ot_surrogate - ot_surrogate.detach() + (
+                    _weight(config, "lambda_ot") * ot_value
+                )
             loss_g.backward()
             opt_g.step()
             global_step += 1
@@ -1402,6 +1411,7 @@ def main() -> None:
                         f" ot_pair={ot_stats['pair_frac']:.3f}"
                         f" ot_slide={ot_stats['slide_frac']:.3f}"
                         f" ot_drop={ot_stats['drop_frac']:.3f}"
+                        f" ot_cos={ot_stats['cos_dist_gen']:.3f}"
                         f" ot_medoids={ot_stats['n_medoids_used']:.1f}"
                         f" ot_pi={ot_stats['pi_row_max']:.3f}"
                     )
@@ -1409,6 +1419,11 @@ def main() -> None:
                     record["loss/ot_pair"] = ot_stats["pair_frac"]
                     record["loss/ot_slide"] = ot_stats["slide_frac"]
                     record["loss/ot_drop"] = ot_stats["drop_frac"]
+                    record["loss/ot_cos"] = ot_stats["cos_dist_gen"]
+                    kind = "benign" if benign_flags[0] else "malig"
+                    record[f"ot_{kind}/drop"] = ot_stats["drop_frac"]
+                    record[f"ot_{kind}/pair"] = ot_stats["pair_frac"]
+                    record[f"ot_{kind}/slide"] = ot_stats["slide_frac"]
                 if field_weight is not None:
                     extras += f" field_w={float(field_weight.mean()):.3f}"
                     record["loss/field_w"] = float(field_weight.mean())

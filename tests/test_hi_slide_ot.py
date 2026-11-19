@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from engine.hi_slide_ot import field_tanh_to_512_rgb01, route_queries
+from engine.hi_slide_ot import field_tanh_to_512_rgb01, foreground_denominator, route_queries
 
 
 def test_paired_match_beats_the_dustbin() -> None:
@@ -52,6 +52,11 @@ def test_bicubic_resize_stays_in_unit_interval() -> None:
         raise AssertionError(f"rgb left [0, 1]: {float(rgb.min())}, {float(rgb.max())}")
 
 
+def test_small_foreground_uses_the_64_token_floor() -> None:
+    if foreground_denominator(4) != 64.0 or foreground_denominator(200) != 200.0:
+        raise AssertionError(f"denominator {foreground_denominator(4)} {foreground_denominator(200)}")
+
+
 def test_generated_tokens_receive_the_gradient() -> None:
     live = torch.nn.functional.normalize(torch.randn(3, 1024), dim=-1).requires_grad_(True)
     target = torch.nn.functional.normalize(torch.randn(3, 1024), dim=-1)
@@ -68,5 +73,6 @@ if __name__ == "__main__":
     test_paired_match_beats_the_dustbin()
     test_zero_padded_medoids_are_not_counted()
     test_bicubic_resize_stays_in_unit_interval()
+    test_small_foreground_uses_the_64_token_floor()
     test_generated_tokens_receive_the_gradient()
     print("ok")

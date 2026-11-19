@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -67,7 +66,7 @@ def spherical_medoids(
         if total <= 1e-12:
             pick = int(torch.randint(0, n, (1,), generator=generator, device=samples.device).item())
         else:
-            pick = int(torch.multinomial(weight / total, 1).item())
+            pick = int(torch.multinomial(weight / total, 1, generator=generator).item())
         centers[center_index] = samples[pick]
         nearest = torch.minimum(nearest, (1.0 - (samples @ centers[center_index])).clamp_min(0.0))
     labels = torch.zeros(n, dtype=torch.long, device=samples.device)
@@ -110,11 +109,27 @@ def _dataset(config: dict) -> tuple[Stage1Dataset, dict[str, int]]:
     return dataset, labels
 
 
-def _groups(dataset: Stage1Dataset) -> dict[str, list[Path]]:
-    grouped: dict[str, list[Path]] = defaultdict(list)
+def _groups(dataset: Stage1Dataset, he_root: Path) -> dict[str, list[Path]]:
+    """Every real H&E tile of a training slide, once.
+
+    Alignment can point several autofluorescence tiles at one H&E file. Counting
+    that file again would overweight it. A pair whose H&E belongs to another
+    slide is refused.
+    """
+    slides = {af_path.name.split("__", 1)[0] for af_path, _pseudo, _he, _collage in dataset.samples}
+    grouped: dict[str, dict[Path, None]] = {slide: {} for slide in slides}
+    if he_root.is_dir():
+        for path in sorted(he_root.glob("*.png")):
+            slide = path.name.split("__", 1)[0]
+            if slide in grouped:
+                grouped[slide][path.resolve()] = None
     for af_path, _pseudo, he_path, _collage in dataset.samples:
-        grouped[af_path.name.split("__", 1)[0]].append(he_path)
-    return grouped
+        af_slide = af_path.name.split("__", 1)[0]
+        he_slide = he_path.name.split("__", 1)[0]
+        if af_slide != he_slide:
+            raise RuntimeError(f"cross-slide pair: {af_path.name} vs {he_path.name}")
+        grouped[af_slide][he_path.resolve()] = None
+    return {slide: list(paths) for slide, paths in grouped.items() if paths}
 
 
 def main() -> None:
@@ -126,7 +141,7 @@ def main() -> None:
     args = parser.parse_args()
     config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     dataset, labels = _dataset(config)
-    grouped = _groups(dataset)
+    grouped = _groups(dataset, Path(config["he_root"]))
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -135,7 +150,8 @@ def main() -> None:
     for slide, paths in grouped.items():
         if labels.get(slide) != 0:
             continue
-        for path in paths[: int(args.pass1_tiles)]:
+        step = max(1, len(paths) // int(args.pass1_tiles))
+        for path in paths[::step][: int(args.pass1_tiles)]:
             field = load_native_image(path).unsqueeze(0).to(device)
             mask = tissue_token_mask_32x32(field)
             optical = ruifrok_h_od_tokens_512(field_tanh_to_512_rgb01(field))

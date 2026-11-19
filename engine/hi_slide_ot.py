@@ -118,6 +118,11 @@ def _barycenter(weights: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
     return F.normalize(weights @ values, dim=-1, eps=1e-8)
 
 
+def foreground_denominator(n_tokens: int) -> float:
+    """Keep a 1–4 token pleura field from amplifying the UNI gradient."""
+    return float(max(int(n_tokens), 64))
+
+
 def route_queries(
     query: torch.Tensor,
     paired: torch.Tensor | None,
@@ -267,7 +272,7 @@ class HiSlideOTLoss(nn.Module):
             numerator = (
                 route["paired_weight"] * distance_pair + route["slide_weight"] * distance_slide
             ).sum()
-            losses.append(numerator / float(n_g))
+            losses.append(numerator / foreground_denominator(n_g))
             matched = (route["paired_weight"] + route["slide_weight"]).sum().clamp(min=1e-6)
             mean_distance = (
                 route["paired_weight"] * distance_pair + route["slide_weight"] * distance_slide
