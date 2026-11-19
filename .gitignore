@@ -23,6 +23,7 @@ manifests/
 retrieval/
 retrieval_smoke/
 teacher_cache/
+caches/
 
 *.pt
 *.pth

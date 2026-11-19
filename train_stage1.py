@@ -540,6 +540,7 @@ def main() -> None:
     use_gan = _weight(config, "lambda_GAN") > 0
     use_nce = _weight(config, "lambda_NCE") > 0
     use_fdl = _weight(config, "lambda_FDL") > 0
+    use_ot = _weight(config, "lambda_ot") > 0
     use_recon = _weight(config, "lambda_recon") > 0
     use_occupancy = _weight(config, "lambda_occupancy") > 0
     use_polarity = _weight(config, "lambda_polarity") > 0
@@ -613,10 +614,12 @@ def main() -> None:
     subtype = None
     mb_weight = None
     subtype_weight = None
-    if use_mb or d_subtype:
+    if use_ot and not config.get("ot_bank_dir"):
+        raise KeyError("lambda_ot requires ot_bank_dir")
+    if use_mb or d_subtype or use_ot:
         label_path = config.get("slide_labels")
         if not label_path:
-            raise KeyError("subtype and benign/malignant heads require slide_labels")
+            raise KeyError("subtype, benign/malignant, and the set match require slide_labels")
         slides = {path.name.split("__", 1)[0] for path, _, _, _ in dataset.samples}
         if d_subtype:
             subtype = _major_subtype_table(label_path)
@@ -793,6 +796,12 @@ def main() -> None:
         retrieval = RetrievalTable(retrieval_dir)
         uni_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
         uni_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+    ot_loss_fn = None
+    if use_ot:
+        from engine.hi_slide_ot import HiSlideOTLoss, SlideMedoidBankStore, build_shared_uni
+        if uni is None:
+            uni = build_shared_uni(device)
+        ot_loss_fn = HiSlideOTLoss(uni, SlideMedoidBankStore(config["ot_bank_dir"])).to(device)
     checkpoint_dir = Path(config["checkpoint_dir"])
     monitor = Monitor()
     if is_main(ctx):
@@ -810,6 +819,7 @@ def main() -> None:
                 ("uni", use_uni),
                 ("mb", use_mb),
                 ("fdl", use_fdl),
+                ("ot", use_ot),
                 ("heat", heat_net is not None),
                 ("field", _weight(config, "lambda_field") > 0),
                 ("dcls", d_cls),
@@ -945,7 +955,7 @@ def main() -> None:
             epoch10_out = (
                 batch["epoch10"].to(device, non_blocking=True)
                 if "epoch10" in batch and (
-                    need_teacher or use_fdl or use_occupancy or use_polarity
+                    need_teacher or use_fdl or use_ot or use_occupancy or use_polarity
                     or field_d is not None
                 )
                 else None
@@ -961,30 +971,6 @@ def main() -> None:
                     cond = None
             fake_field = stitch_quadrants(fake)
             he_field = stitch_quadrants(he)
-            fake_feats = None
-            af_feats = None
-            if use_nce:
-                # One 1024 field, not four 512 crops. The query carries grad
-                # through the stitch. The AF key is detached, as in CUT.
-                # Encode on the unwrapped module. Generate already ran those
-                # parameters through DDP, so this backward adds into the same
-                # grads and the hook allreduces the sum. A second wrapped
-                # forward would mark the decoder unused and hang the reducer.
-                n_fields = fake_field.shape[0]
-                collage_field = _one_per_field(collage, n_fields)
-                cells_field = _one_per_field(cells, n_fields)
-                black_field = _one_per_field(black, n_fields)
-                af_field = stitch_quadrants(af)
-
-                def _encode_field(image):
-                    return raw_g.encoder_features(image, collage_field, cells_field, black_field)
-
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                    fake_feats = torch.utils.checkpoint.checkpoint(
-                        _encode_field, fake_field, use_reentrant=False,
-                    )
-                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                    af_feats = raw_g.encoder_features(af_field, collage_field, cells_field, black_field)
             slide_vec = None
             field_weight = None
             real_field_weight = None
@@ -1084,6 +1070,27 @@ def main() -> None:
                 opt_field.step()
 
             opt_g.zero_grad(set_to_none=True)
+            ot_grad = None
+            ot_stats = None
+            ot_value = None
+            if use_ot:
+                if epoch10_out is None:
+                    raise RuntimeError("the set match needs the epoch-10 image")
+                if diagnosis is None:
+                    raise RuntimeError("the set match needs benign/malignant slide labels")
+                # The plan is a detached leaf. One later backward through the
+                # stitched field is the only generator backward, so DDP reduces once.
+                # This run uses bf16 and no GradScaler, so the leaf gradient is unscaled.
+                proxy = fake_field.detach().requires_grad_(True)
+                slide_ids = list(batch["slide"])
+                benign_flags = [diagnosis[slide] == 0 for slide in slide_ids]
+                loss_ot, ot_stats = ot_loss_fn(
+                    proxy, stitch_quadrants(epoch10_out), he_field, slide_ids, benign_flags,
+                )
+                ot_value = float(loss_ot.detach())
+                (_weight(config, "lambda_ot") * loss_ot).backward()
+                ot_grad = proxy.grad.detach() if proxy.grad is not None else torch.zeros_like(fake_field)
+                del loss_ot, proxy
             scaled = {}
             gate = None
             prob = None
@@ -1138,7 +1145,30 @@ def main() -> None:
                 scaled["field"] = _weight(config, "lambda_field") * multilevel_bce(
                     generated_field, True, field_weight,
                 )
+            fake_feats = None
+            af_feats = None
             if use_nce:
+                # One 1024 field, not four 512 crops. The query carries grad
+                # through the stitch. The AF key is detached, as in CUT.
+                # Encode on the unwrapped module. Generate already ran those
+                # parameters through DDP, so this backward adds into the same
+                # grads and the hook allreduces the sum. A second wrapped
+                # forward would mark the decoder unused and hang the reducer.
+                n_fields = fake_field.shape[0]
+                collage_field = _one_per_field(collage, n_fields)
+                cells_field = _one_per_field(cells, n_fields)
+                black_field = _one_per_field(black, n_fields)
+                af_field = stitch_quadrants(af)
+
+                def _encode_field(image):
+                    return raw_g.encoder_features(image, collage_field, cells_field, black_field)
+
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    fake_feats = torch.utils.checkpoint.checkpoint(
+                        _encode_field, fake_field, use_reentrant=False,
+                    )
+                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    af_feats = raw_g.encoder_features(af_field, collage_field, cells_field, black_field)
                 query, source_key = projector(
                     [_maps(fake_feats, layers), _maps(af_feats, layers)],
                     int(config["num_patches"]),
@@ -1344,6 +1374,8 @@ def main() -> None:
             else:
                 heat_keep = None
             loss_g = sum(scaled.values())
+            if ot_grad is not None:
+                loss_g = loss_g + (fake_field.float() * ot_grad.float()).sum()
             loss_g.backward()
             opt_g.step()
             global_step += 1
@@ -1364,6 +1396,19 @@ def main() -> None:
                 if heat_keep is not None:
                     extras += f" heat_w={heat_keep:.3f}"
                     record["loss/heat_w"] = heat_keep
+                if ot_stats is not None:
+                    extras += (
+                        f" ot={_weight(config, 'lambda_ot') * ot_value:.4f}"
+                        f" ot_pair={ot_stats['pair_frac']:.3f}"
+                        f" ot_slide={ot_stats['slide_frac']:.3f}"
+                        f" ot_drop={ot_stats['drop_frac']:.3f}"
+                        f" ot_medoids={ot_stats['n_medoids_used']:.1f}"
+                        f" ot_pi={ot_stats['pi_row_max']:.3f}"
+                    )
+                    record["loss/ot"] = _weight(config, "lambda_ot") * ot_value
+                    record["loss/ot_pair"] = ot_stats["pair_frac"]
+                    record["loss/ot_slide"] = ot_stats["slide_frac"]
+                    record["loss/ot_drop"] = ot_stats["drop_frac"]
                 if field_weight is not None:
                     extras += f" field_w={float(field_weight.mean()):.3f}"
                     record["loss/field_w"] = float(field_weight.mean())
