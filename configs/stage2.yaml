@@ -57,9 +57,9 @@ num_patches: 256
 nce_domain_adapter: true
 nce_fn_thresh: 0.80
 nce_fn_temp: 0.05
-# The trainer also multiplies this by lambda_NCE. 1.0 gives the relation the same outer weight as PatchNCE.
-nce_src: 1.0
-nce_src_T: 0.07
+# Summed Jensen-Shannon, then multiplied by lambda_NCE. 0.25 gives an effective weight of 0.05.
+nce_src: 0.25
+nce_src_T: 1.0
 
 lambda_GAN: 1.0
 netD_num_scales: 4

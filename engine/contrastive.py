@@ -74,8 +74,9 @@ def retrieval_pair_weight(
 class DebiasedPatchNCESRC(nn.Module):
     """PatchNCE with soft same-tissue negatives removed, plus relation consistency.
 
-    The relation term is KL from the detached AF patch-similarity distribution
-    to the generated one. ``lambda_src`` already scales that term.
+    The relation term is Jensen-Shannon divergence between the projected
+    patch-similarity distributions. It is bounded by ln 2. ``lambda_src``
+    already scales that term.
     """
 
     def __init__(
@@ -85,7 +86,7 @@ class DebiasedPatchNCESRC(nn.Module):
         fn_temp: float = 0.05,
         min_neg_weight: float = 1e-4,
         use_src: bool = True,
-        tau_src: float = 0.07,
+        tau_src: float = 1.0,
         lambda_src: float = 0.5,
     ):
         super().__init__()
@@ -133,13 +134,17 @@ class DebiasedPatchNCESRC(nn.Module):
         weight_mean = negative_weight.masked_select(off_diagonal.expand_as(negative_weight)).mean()
         if not self.use_src:
             return nce, logits.new_zeros(()), weight_mean.detach()
-        # The fixed target is the centered AF affinity, so the relation term
-        # does not depend on the randomly initialized projector.
-        sim_key = affinity.masked_fill(eye, -1e9)
+        # Both sides are uncentered unit-sphere projections. The key side is
+        # detached, so this cannot divide by a vanishing centered norm.
+        sim_key = torch.bmm(key.detach(), key.detach().transpose(1, 2)).masked_fill(eye, -1e9)
         sim_query = torch.bmm(query, query.transpose(1, 2)).masked_fill(eye, -1e9)
-        target = F.softmax(sim_key / self.tau_src, dim=-1).detach()
-        predicted = F.log_softmax(sim_query / self.tau_src, dim=-1)
-        relation = F.kl_div(predicted, target, reduction="none").sum(dim=-1).mean()
+        prob_af = F.softmax(sim_key / self.tau_src, dim=-1)
+        prob_he = F.softmax(sim_query / self.tau_src, dim=-1)
+        mixture = (0.5 * (prob_af + prob_he)).clamp(min=1e-7)
+        kl_af = (prob_af * (prob_af.clamp(min=1e-7).log() - mixture.log())).sum(dim=-1)
+        kl_he = (prob_he * (prob_he.clamp(min=1e-7).log() - mixture.log())).sum(dim=-1)
+        # Sum over the patch anchors and average over the batch, as in Hneg-SRC.
+        relation = (0.5 * (kl_af + kl_he)).sum(dim=-1).mean()
         return nce, self.lambda_src * relation, weight_mean.detach()
 
 
