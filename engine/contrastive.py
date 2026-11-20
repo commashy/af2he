@@ -85,7 +85,7 @@ class DebiasedPatchNCESRC(nn.Module):
         fn_temp: float = 0.05,
         min_neg_weight: float = 1e-4,
         use_src: bool = True,
-        tau_src: float = 0.15,
+        tau_src: float = 0.07,
         lambda_src: float = 0.5,
     ):
         super().__init__()
@@ -112,9 +112,13 @@ class DebiasedPatchNCESRC(nn.Module):
         _batch, count, _dim = query.shape
         eye = torch.eye(count, device=query.device, dtype=torch.bool).unsqueeze(0)
         if raw_k is None:
-            reference = key
+            ref_raw = key.detach()
         else:
-            reference = F.normalize(raw_k.detach().float(), p=2, dim=-1)
+            ref_raw = raw_k.detach().float()
+        # Center across the sampled patches so cosine measures a difference
+        # inside the tile, not the shared channel mean.
+        ref_centered = ref_raw - ref_raw.mean(dim=1, keepdim=True)
+        reference = F.normalize(ref_centered, p=2, dim=-1, eps=1e-6)
         affinity = torch.bmm(reference, reference.transpose(1, 2))
         negative_weight = 1.0 - torch.sigmoid((affinity - self.fn_thresh) / self.fn_temp)
         logits = torch.bmm(query, key.transpose(1, 2)) / self.tau_nce
@@ -129,7 +133,9 @@ class DebiasedPatchNCESRC(nn.Module):
         weight_mean = negative_weight.masked_select(off_diagonal.expand_as(negative_weight)).mean()
         if not self.use_src:
             return nce, logits.new_zeros(()), weight_mean.detach()
-        sim_key = torch.bmm(key, key.transpose(1, 2)).masked_fill(eye, -1e9)
+        # The fixed target is the centered AF affinity, so the relation term
+        # does not depend on the randomly initialized projector.
+        sim_key = affinity.masked_fill(eye, -1e9)
         sim_query = torch.bmm(query, query.transpose(1, 2)).masked_fill(eye, -1e9)
         target = F.softmax(sim_key / self.tau_src, dim=-1).detach()
         predicted = F.log_softmax(sim_query / self.tau_src, dim=-1)

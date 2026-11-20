@@ -594,7 +594,7 @@ def main() -> None:
             fn_thresh=float(config.get("nce_fn_thresh", 0.80)),
             fn_temp=float(config.get("nce_fn_temp", 0.05)),
             use_src=float(config.get("nce_src", 0.5)) > 0,
-            tau_src=float(config.get("nce_src_T", 0.15)),
+            tau_src=float(config.get("nce_src_T", 0.07)),
             lambda_src=float(config.get("nce_src", 0.5)),
         )
     else:
