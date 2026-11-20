@@ -58,3 +58,61 @@ class PatchProjector(nn.Module):
             projected, ids = self._project(feats, num_patches, ids)
             outputs.append(projected)
         return outputs
+
+
+class DomainAdapter(nn.Module):
+    """Per-patch LayerNorm, then a domain scale and shift. Two vectors per domain."""
+
+    def __init__(self, in_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(int(in_dim), elementwise_affine=False)
+        self.gamma_af = nn.Parameter(torch.ones(1, 1, int(in_dim)))
+        self.beta_af = nn.Parameter(torch.zeros(1, 1, int(in_dim)))
+        self.gamma_he = nn.Parameter(torch.ones(1, 1, int(in_dim)))
+        self.beta_he = nn.Parameter(torch.zeros(1, 1, int(in_dim)))
+
+    def forward(self, patches: torch.Tensor, domain: str) -> torch.Tensor:
+        aligned = self.norm(patches.float())
+        if domain == "af":
+            return aligned * self.gamma_af + self.beta_af
+        if domain == "he":
+            return aligned * self.gamma_he + self.beta_he
+        raise ValueError(f"domain must be af or he, got {domain}")
+
+
+class DomainAdaptedPatchProjector(nn.Module):
+    """One domain adapter and one shared MLP for each encoder map."""
+
+    def __init__(self, channels: list[int], width: int = 256):
+        super().__init__()
+        self.adapters = nn.ModuleList([DomainAdapter(int(channel)) for channel in channels])
+        self.shared_mlps = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(int(channel), int(width)),
+                    nn.ReLU(),
+                    nn.Linear(int(width), int(width)),
+                )
+                for channel in channels
+            ]
+        )
+        for mlp in self.shared_mlps:
+            for module in mlp.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.normal_(module.weight, 0.0, 0.02)
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, sampled: list[torch.Tensor], domain: str) -> list[torch.Tensor]:
+        if len(sampled) != len(self.adapters):
+            raise ValueError(f"{len(sampled)} patch groups for {len(self.adapters)} adapters")
+        outputs = []
+        for patches, adapter, mlp in zip(sampled, self.adapters, self.shared_mlps):
+            hidden = mlp(adapter(patches, domain))
+            outputs.append(F.normalize(hidden, p=2, dim=-1))
+        return outputs
+
+    def param_groups(self, lr: float, adapter_wd: float = 1e-4) -> list[dict]:
+        return [
+            {"params": list(self.adapters.parameters()), "lr": lr, "weight_decay": adapter_wd},
+            {"params": list(self.shared_mlps.parameters()), "lr": lr, "weight_decay": 0.0},
+        ]

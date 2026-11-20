@@ -1,5 +1,0 @@
-numpy
-pillow
-tifffile
-zarr
-torch

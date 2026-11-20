@@ -28,7 +28,7 @@ from torch.utils.data.distributed import DistributedSampler
 from data.retrieval_table import RetrievalTable
 from data.stage1 import Stage1Dataset, collate_stage1, seam_windows, stitch_quadrants
 from engine.checkpoint import unwrap
-from engine.contrastive import field_info_nce, patch_nce, retrieval_pair_weight
+from engine.contrastive import DebiasedPatchNCESRC, field_info_nce, patch_nce, retrieval_pair_weight
 from engine.distributed import cleanup, is_main, setup
 from engine.monitor import Monitor
 from engine.image_losses import (
@@ -62,7 +62,7 @@ from models.discriminator import (
 from models.field_critic import ConchFieldDiscriminator, multilevel_bce
 from models.generator import BOTTLENECK_DIM, FEATURE_CHANNELS, Generator, resize_collage_positions
 from models.heat_classifier import HeatClassifier
-from models.sample import PatchProjector
+from models.sample import DomainAdaptedPatchProjector, PatchProjector
 from models.slide_head import SlideDiagnosisHead
 from models.wsi_collage_encoder import WSICollageAdapter
 
@@ -196,6 +196,25 @@ def _one_per_field(tensor: torch.Tensor | None, n_fields: int) -> torch.Tensor |
     if tensor.shape[0] == n_fields * 4:
         return tensor[::4]
     raise RuntimeError(f"{tensor.shape[0]} rows for {n_fields} fields")
+
+
+def _sample_paired_patches(
+    query_feats: list[torch.Tensor],
+    key_feats: list[torch.Tensor],
+    num_patches: int,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Same spatial sites in both domains. The key is detached."""
+    query_out = []
+    key_out = []
+    for query, key in zip(query_feats, key_feats):
+        if query.shape[-2:] != key.shape[-2:]:
+            raise RuntimeError(f"patch grids {tuple(query.shape[-2:])} and {tuple(key.shape[-2:])}")
+        _batch, _channels, height, width = key.shape
+        count = min(int(num_patches), height * width)
+        choice = torch.randperm(height * width, device=key.device)[:count]
+        key_out.append(key.detach().flatten(2).transpose(1, 2)[:, choice, :])
+        query_out.append(query.flatten(2).transpose(1, 2)[:, choice, :])
+    return query_out, key_out
 
 
 def _maps(feats: list[torch.Tensor], layers: list[int]) -> list[torch.Tensor]:
@@ -540,7 +559,6 @@ def main() -> None:
     use_gan = _weight(config, "lambda_GAN") > 0
     use_nce = _weight(config, "lambda_NCE") > 0
     use_fdl = _weight(config, "lambda_FDL") > 0
-    use_ot = _weight(config, "lambda_ot") > 0
     use_recon = _weight(config, "lambda_recon") > 0
     use_occupancy = _weight(config, "lambda_occupancy") > 0
     use_polarity = _weight(config, "lambda_polarity") > 0
@@ -568,7 +586,20 @@ def main() -> None:
         heat_net.eval()
         for parameter in heat_net.parameters():
             parameter.requires_grad_(False)
-    projector = PatchProjector(channels).to(device) if use_nce else None
+    domain_nce = bool(config.get("nce_domain_adapter", False)) and use_nce
+    if domain_nce:
+        projector = DomainAdaptedPatchProjector(channels).to(device)
+        nce_relation = DebiasedPatchNCESRC(
+            tau_nce=float(config["nce_T"]),
+            fn_thresh=float(config.get("nce_fn_thresh", 0.80)),
+            fn_temp=float(config.get("nce_fn_temp", 0.05)),
+            use_src=float(config.get("nce_src", 0.5)) > 0,
+            tau_src=float(config.get("nce_src_T", 0.15)),
+            lambda_src=float(config.get("nce_src", 0.5)),
+        )
+    else:
+        projector = PatchProjector(channels).to(device) if use_nce else None
+        nce_relation = None
     fdl = AmplitudeFDL(
         num_proj=int(config["fdl_num_proj"]),
         input_size=int(config["fdl_input_size"]),
@@ -614,12 +645,10 @@ def main() -> None:
     subtype = None
     mb_weight = None
     subtype_weight = None
-    if use_ot and not config.get("ot_bank_dir"):
-        raise KeyError("lambda_ot requires ot_bank_dir")
-    if use_mb or d_subtype or use_ot:
+    if use_mb or d_subtype:
         label_path = config.get("slide_labels")
         if not label_path:
-            raise KeyError("subtype, benign/malignant, and the set match require slide_labels")
+            raise KeyError("subtype and benign/malignant require slide_labels")
         slides = {path.name.split("__", 1)[0] for path, _, _, _ in dataset.samples}
         if d_subtype:
             subtype = _major_subtype_table(label_path)
@@ -657,8 +686,6 @@ def main() -> None:
             )
             if use_mb:
                 slide_head = SlideDiagnosisHead(BOTTLENECK_DIM).to(device)
-        if use_ot and diagnosis is None:
-            diagnosis = _diagnosis_table(label_path)
         if slide_head is not None and payload is not None and payload.get("slide_head"):
             slide_head.load_state_dict(payload["slide_head"])
         if slide_head is not None and ctx.distributed:
@@ -667,7 +694,9 @@ def main() -> None:
         _freeze_wsi_encoder(generator)
     trainable = [parameter for parameter in generator.parameters() if parameter.requires_grad]
     generator_groups = [{"params": trainable, "lr": float(config["lr_G"])}]
-    if projector is not None:
+    if isinstance(projector, DomainAdaptedPatchProjector):
+        generator_groups.extend(projector.param_groups(float(config["lr_F"])))
+    elif projector is not None:
         generator_groups.append({"params": projector.parameters(), "lr": float(config["lr_F"])})
     saved_generator_groups = (
         len(payload["optimizer_g"]["param_groups"]) if payload is not None else len(generator_groups)
@@ -799,12 +828,6 @@ def main() -> None:
         retrieval = RetrievalTable(retrieval_dir)
         uni_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
         uni_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-    ot_loss_fn = None
-    if use_ot:
-        from engine.hi_slide_ot import HiSlideOTLoss, SlideMedoidBankStore, build_shared_uni
-        if uni is None:
-            uni = build_shared_uni(device)
-        ot_loss_fn = HiSlideOTLoss(uni, SlideMedoidBankStore(config["ot_bank_dir"])).to(device)
     checkpoint_dir = Path(config["checkpoint_dir"])
     monitor = Monitor()
     if is_main(ctx):
@@ -822,7 +845,6 @@ def main() -> None:
                 ("uni", use_uni),
                 ("mb", use_mb),
                 ("fdl", use_fdl),
-                ("ot", use_ot),
                 ("heat", heat_net is not None),
                 ("field", _weight(config, "lambda_field") > 0),
                 ("dcls", d_cls),
@@ -900,6 +922,13 @@ def main() -> None:
             recon_scale = reconstruction_scale(epoch) if use_recon else 0.0
             recon_weight = recon_scale * _weight(config, "lambda_recon")
             recon_sigma = float(config.get("recon_sigma", 0.0))
+        fdl_schedule = [float(value) for value in config.get("fdl_weight_schedule", [])]
+        if use_fdl and fdl_schedule:
+            fdl_weight = fdl_schedule[min(epoch, len(fdl_schedule) - 1)]
+        elif use_fdl:
+            fdl_weight = _weight(config, "lambda_FDL")
+        else:
+            fdl_weight = 0.0
         structure_on = recon_weight <= 0 and (use_occupancy or use_polarity)
         occ_weight = _weight(config, "lambda_occupancy") if structure_on and use_occupancy else 0.0
         pol_weight = _weight(config, "lambda_polarity") if structure_on and use_polarity else 0.0
@@ -922,7 +951,8 @@ def main() -> None:
             if d_slide:
                 film_note = f" d_film={unwrap(discriminator).film_alpha():.4f}"
             print(
-                f"epoch {epoch + 1} recon={recon_weight:.3f} sigma={recon_sigma:g}{occ_note}{film_note}",
+                f"epoch {epoch + 1} recon={recon_weight:.3f} sigma={recon_sigma:g}"
+                f"{f' fdl={fdl_weight:.3f}' if use_fdl else ''}{occ_note}{film_note}",
                 flush=True,
             )
         if sampler is not None:
@@ -958,7 +988,7 @@ def main() -> None:
             epoch10_out = (
                 batch["epoch10"].to(device, non_blocking=True)
                 if "epoch10" in batch and (
-                    need_teacher or use_fdl or use_ot or recon_weight > 0
+                    need_teacher or use_fdl or recon_weight > 0
                     or use_occupancy or use_polarity
                     or field_d is not None
                 )
@@ -1052,6 +1082,7 @@ def main() -> None:
                         loss_d = loss_d + subtype_term
                 loss_d.backward()
                 opt_d.step()
+                del real_logits, real_classes, fake_logits, _fake_classes
             field_d_term = None
             if field_d is not None:
                 taken = _optimizer_steps(opt_field)
@@ -1074,27 +1105,6 @@ def main() -> None:
                 opt_field.step()
 
             opt_g.zero_grad(set_to_none=True)
-            ot_grad = None
-            ot_stats = None
-            ot_value = None
-            if use_ot:
-                if epoch10_out is None:
-                    raise RuntimeError("the set match needs the epoch-10 image")
-                if diagnosis is None:
-                    raise RuntimeError("the set match needs benign/malignant slide labels")
-                # The plan is a detached leaf. One later backward through the
-                # stitched field is the only generator backward, so DDP reduces once.
-                # This run uses bf16 and no GradScaler, so the leaf gradient is unscaled.
-                proxy = fake_field.detach().requires_grad_(True)
-                slide_ids = list(batch["slide"])
-                benign_flags = [diagnosis[slide] == 0 for slide in slide_ids]
-                loss_ot, ot_stats = ot_loss_fn(
-                    proxy, stitch_quadrants(epoch10_out), he_field, slide_ids, benign_flags,
-                )
-                ot_value = float(loss_ot.detach())
-                (_weight(config, "lambda_ot") * loss_ot).backward()
-                ot_grad = proxy.grad.detach() if proxy.grad is not None else torch.zeros_like(fake_field)
-                del loss_ot, proxy
             scaled = {}
             gate = None
             prob = None
@@ -1139,6 +1149,7 @@ def main() -> None:
                 scaled["gan"] = _weight(config, "lambda_GAN") * gan
                 if scaled_cls is not None:
                     scaled["gcls"] = scaled_cls
+                del fake_logits, fake_classes
             if field_d is not None:
                 for parameter in field_d.parameters():
                     parameter.requires_grad_(False)
@@ -1151,6 +1162,7 @@ def main() -> None:
                 )
             fake_feats = None
             af_feats = None
+            nce_neg_weight = None
             if use_nce:
                 # One 1024 field, not four 512 crops. The query carries grad
                 # through the stitch. The AF key is detached, as in CUT.
@@ -1165,26 +1177,56 @@ def main() -> None:
                 af_field = stitch_quadrants(af)
 
                 def _encode_field(image):
-                    return raw_g.encoder_features(image, collage_field, cells_field, black_field)
+                    # Keep only the PatchNCE stages. The other encoder maps are
+                    # not inputs to the loss, so checkpoint does not store them.
+                    return _maps(
+                        raw_g.encoder_features(image, collage_field, cells_field, black_field),
+                        layers,
+                    )
 
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     fake_feats = torch.utils.checkpoint.checkpoint(
                         _encode_field, fake_field, use_reentrant=False,
                     )
                 with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                    af_feats = raw_g.encoder_features(af_field, collage_field, cells_field, black_field)
-                query, source_key = projector(
-                    [_maps(fake_feats, layers), _maps(af_feats, layers)],
-                    int(config["num_patches"]),
-                )
-                nce = _contrast(
-                    query, source_key,
-                    # One bank per 1024 field. The current batch is one field, so this is 1.
-                    lambda left, right: patch_nce(
-                        left, right, fake_field.shape[0], float(config["nce_T"]),
-                    ),
-                )
-                scaled["nce"] = _weight(config, "lambda_NCE") * nce
+                    af_feats = _encode_field(af_field)
+                if domain_nce:
+                    raw_he, raw_af = _sample_paired_patches(
+                        fake_feats, af_feats, int(config["num_patches"]),
+                    )
+                    projected_he = projector(raw_he, "he")
+                    projected_af = projector(raw_af, "af")
+                    nce_terms = []
+                    src_terms = []
+                    weight_terms = []
+                    for query, key, raw_key in zip(projected_he, projected_af, raw_af):
+                        nce_term, src_term, neg_weight = nce_relation(query, key, raw_key)
+                        nce_terms.append(nce_term)
+                        src_terms.append(src_term)
+                        weight_terms.append(neg_weight)
+                    nce = torch.stack(nce_terms).mean()
+                    src = torch.stack(src_terms).mean()
+                    nce_neg_weight = float(torch.stack(weight_terms).mean())
+                    contrast_weight = _weight(config, "lambda_NCE")
+                    scaled["nce"] = contrast_weight * nce
+                    scaled["src"] = contrast_weight * src
+                    del raw_he, raw_af, projected_he, projected_af
+                else:
+                    query, source_key = projector(
+                        [fake_feats, af_feats],
+                        int(config["num_patches"]),
+                    )
+                    nce = _contrast(
+                        query, source_key,
+                        # One bank per 1024 field. The current batch is one field, so this is 1.
+                        lambda left, right: patch_nce(
+                            left, right, fake_field.shape[0], float(config["nce_T"]),
+                        ),
+                    )
+                    nce_neg_weight = None
+                    scaled["nce"] = _weight(config, "lambda_NCE") * nce
+                    del query, source_key
+                del fake_feats, af_feats, af_field
             if use_fdl:
                 if epoch10_out is not None:
                     aligned = stitch_quadrants(epoch10_out)
@@ -1196,7 +1238,7 @@ def main() -> None:
                     raise RuntimeError("FDL gate needs an aligned stain image")
                 gate = content_gate(aligned, he_field)
                 frequency = (fdl(fake_field, he_field) * gate).mean()
-                scaled["fdl"] = _weight(config, "lambda_FDL") * frequency
+                scaled["fdl"] = fdl_weight * frequency
             if seam_targets is not None:
                 overlap = fake.new_zeros(())
                 for window, target in zip(seam_windows(fake_field), seam_targets):
@@ -1378,13 +1420,6 @@ def main() -> None:
             else:
                 heat_keep = None
             loss_g = sum(scaled.values())
-            if ot_grad is not None:
-                # The dot product carries the gradient. Its value is not the loss,
-                # so the logged total uses the set-match loss itself.
-                ot_surrogate = (fake_field.float() * ot_grad.float()).sum()
-                loss_g = loss_g + ot_surrogate - ot_surrogate.detach() + (
-                    _weight(config, "lambda_ot") * ot_value
-                )
             loss_g.backward()
             opt_g.step()
             global_step += 1
@@ -1405,25 +1440,9 @@ def main() -> None:
                 if heat_keep is not None:
                     extras += f" heat_w={heat_keep:.3f}"
                     record["loss/heat_w"] = heat_keep
-                if ot_stats is not None:
-                    extras += (
-                        f" ot={_weight(config, 'lambda_ot') * ot_value:.4f}"
-                        f" ot_pair={ot_stats['pair_frac']:.3f}"
-                        f" ot_slide={ot_stats['slide_frac']:.3f}"
-                        f" ot_drop={ot_stats['drop_frac']:.3f}"
-                        f" ot_cos={ot_stats['cos_dist_gen']:.3f}"
-                        f" ot_medoids={ot_stats['n_medoids_used']:.1f}"
-                        f" ot_pi={ot_stats['pi_row_max']:.3f}"
-                    )
-                    record["loss/ot"] = _weight(config, "lambda_ot") * ot_value
-                    record["loss/ot_pair"] = ot_stats["pair_frac"]
-                    record["loss/ot_slide"] = ot_stats["slide_frac"]
-                    record["loss/ot_drop"] = ot_stats["drop_frac"]
-                    record["loss/ot_cos"] = ot_stats["cos_dist_gen"]
-                    kind = "benign" if benign_flags[0] else "malig"
-                    record[f"ot_{kind}/drop"] = ot_stats["drop_frac"]
-                    record[f"ot_{kind}/pair"] = ot_stats["pair_frac"]
-                    record[f"ot_{kind}/slide"] = ot_stats["slide_frac"]
+                if nce_neg_weight is not None:
+                    extras += f" nce_w={nce_neg_weight:.3f}"
+                    record["loss/nce_w"] = nce_neg_weight
                 if field_weight is not None:
                     extras += f" field_w={float(field_weight.mean()):.3f}"
                     record["loss/field_w"] = float(field_weight.mean())

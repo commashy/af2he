@@ -13,7 +13,7 @@ collage_size: 1024
 pretrain_checkpoint: /mnt/10tb_hdd/taek/af2he/checkpoints/pretrain/last.pt
 compile: false
 compile_mode: default
-checkpoint_dir: /mnt/10tb_hdd/taek/af2he/checkpoints/stage2_af
+checkpoint_dir: /mnt/10tb_hdd/taek/af2he/checkpoints/stage2_nce
 
 batch_size: 4
 num_workers: 4
@@ -47,21 +47,29 @@ wandb_project: af2he
 lambda_mb: 0.1
 slide_labels: /mnt/10tb_hdd/taek/stain_translation_core/manifests/fresh/train_slide_labels.csv
 
-# CUT PatchNCE. Weight 0.2. Chance is about 1.11.
+# Domain-adapted PatchNCE. Weight 0.2. Layers 2, 3, and 4 on the 1024 field.
 lambda_NCE: 0.2
 # AF gray >= 0.60 must keep light stain. The penalty stops at optical density 0.35.
 lambda_keep: 1.0
 nce_T: 0.07
 nce_layers: [2, 3, 4]
 num_patches: 256
+nce_domain_adapter: true
+nce_fn_thresh: 0.80
+nce_fn_temp: 0.05
+nce_src: 0.5
+nce_src_T: 0.15
 
 lambda_GAN: 1.0
 netD_num_scales: 4
 
 lambda_FDL: 0.003
+# Epoch 1, epoch 2, then epoch 3 through the end.
+fdl_weight_schedule: [0.003, 0.004, 0.005]
 fdl_input_size: 512
 # Gate the whole frequency loss. Similar tissue amount keeps it; a mismatch drops it.
-fdl_phase_weight: 1.0
+# Phase is off. Magnitude still compares the real H&E tile.
+fdl_phase_weight: 0.0
 fdl_num_proj: 256
 heat_targets: /mnt/10tb_hdd/taek/af2he/manifests/heat_patch_targets.csv
 malignancy_checkpoint: /mnt/10tb_hdd/taek/af2he/checkpoints/heat_classifier/best.pt
