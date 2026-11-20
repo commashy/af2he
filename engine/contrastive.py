@@ -10,7 +10,6 @@ not detached.
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -69,83 +68,6 @@ def retrieval_pair_weight(
     if high <= low:
         raise ValueError(f"cosine ramp needs high > low, got {low} to {high}")
     return ((cosine.detach().float() - low) / (high - low)).clamp(0.0, 1.0)
-
-
-class DebiasedPatchNCESRC(nn.Module):
-    """PatchNCE with soft same-tissue negatives removed, plus relation consistency.
-
-    The relation term is Jensen-Shannon divergence between the projected
-    patch-similarity distributions. It is bounded by ln 2. ``lambda_src``
-    already scales that term.
-    """
-
-    def __init__(
-        self,
-        tau_nce: float = 0.07,
-        fn_thresh: float = 0.80,
-        fn_temp: float = 0.05,
-        min_neg_weight: float = 1e-4,
-        use_src: bool = True,
-        tau_src: float = 1.0,
-        lambda_src: float = 0.5,
-    ):
-        super().__init__()
-        self.tau_nce = float(tau_nce)
-        self.fn_thresh = float(fn_thresh)
-        self.fn_temp = float(fn_temp)
-        self.min_neg_weight = float(min_neg_weight)
-        self.use_src = bool(use_src)
-        self.tau_src = float(tau_src)
-        self.lambda_src = float(lambda_src)
-
-    def forward(
-        self,
-        feat_q: torch.Tensor,
-        feat_k: torch.Tensor,
-        raw_k: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # The AF encoder input is already detached. The projected key stays
-        # connected so the AF scale and shift receive a gradient.
-        query = feat_q.float()
-        key = feat_k.float()
-        if query.ndim != 3 or query.shape != key.shape:
-            raise ValueError(f"query {tuple(query.shape)} key {tuple(key.shape)}")
-        _batch, count, _dim = query.shape
-        eye = torch.eye(count, device=query.device, dtype=torch.bool).unsqueeze(0)
-        if raw_k is None:
-            ref_raw = key.detach()
-        else:
-            ref_raw = raw_k.detach().float()
-        # Center across the sampled patches so cosine measures a difference
-        # inside the tile, not the shared channel mean.
-        ref_centered = ref_raw - ref_raw.mean(dim=1, keepdim=True)
-        reference = F.normalize(ref_centered, p=2, dim=-1, eps=1e-6)
-        affinity = torch.bmm(reference, reference.transpose(1, 2))
-        negative_weight = 1.0 - torch.sigmoid((affinity - self.fn_thresh) / self.fn_temp)
-        logits = torch.bmm(query, key.transpose(1, 2)) / self.tau_nce
-        positive = torch.diagonal(logits, dim1=1, dim2=2)
-        weighted = torch.where(
-            eye,
-            logits,
-            logits + torch.log(negative_weight.clamp(min=self.min_neg_weight)),
-        )
-        nce = (-positive + torch.logsumexp(weighted, dim=-1)).mean()
-        off_diagonal = ~eye
-        weight_mean = negative_weight.masked_select(off_diagonal.expand_as(negative_weight)).mean()
-        if not self.use_src:
-            return nce, logits.new_zeros(()), weight_mean.detach()
-        # Both sides are uncentered unit-sphere projections. The key side is
-        # detached, so this cannot divide by a vanishing centered norm.
-        sim_key = torch.bmm(key.detach(), key.detach().transpose(1, 2)).masked_fill(eye, -1e9)
-        sim_query = torch.bmm(query, query.transpose(1, 2)).masked_fill(eye, -1e9)
-        prob_af = F.softmax(sim_key / self.tau_src, dim=-1)
-        prob_he = F.softmax(sim_query / self.tau_src, dim=-1)
-        mixture = (0.5 * (prob_af + prob_he)).clamp(min=1e-7)
-        kl_af = (prob_af * (prob_af.clamp(min=1e-7).log() - mixture.log())).sum(dim=-1)
-        kl_he = (prob_he * (prob_he.clamp(min=1e-7).log() - mixture.log())).sum(dim=-1)
-        # Sum over the patch anchors and average over the batch, as in Hneg-SRC.
-        relation = (0.5 * (kl_af + kl_he)).sum(dim=-1).mean()
-        return nce, self.lambda_src * relation, weight_mean.detach()
 
 
 def patch_nce(query: torch.Tensor, key: torch.Tensor, batch_size: int, temperature: float = 0.07) -> torch.Tensor:

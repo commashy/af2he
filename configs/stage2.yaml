@@ -47,19 +47,18 @@ wandb_project: af2he
 lambda_mb: 0.1
 slide_labels: /mnt/10tb_hdd/taek/stain_translation_core/manifests/fresh/train_slide_labels.csv
 
-# Domain-adapted PatchNCE. Weight 0.2. Layers 2, 3, and 4 on the 1024 field.
+# Local self-similarity between the AF encoder and the pre-skip decoder.
 lambda_NCE: 0.2
 # AF gray >= 0.60 must keep light stain. The penalty stops at optical density 0.35.
 lambda_keep: 1.0
 nce_T: 0.07
 nce_layers: [2, 3, 4]
 num_patches: 256
-nce_domain_adapter: true
-nce_fn_thresh: 0.80
-nce_fn_temp: 0.05
-# Summed Jensen-Shannon, then multiplied by lambda_NCE. 0.25 gives an effective weight of 0.05.
-nce_src: 0.25
-nce_src_T: 1.0
+nce_mode: enco_lsesim
+lsesim_kernel: 7
+lsesim_dilation: 1
+lsesim_hidden: 128
+lsesim_fg_ratio: 0.85
 
 lambda_GAN: 1.0
 netD_num_scales: 4

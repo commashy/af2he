@@ -453,13 +453,35 @@ class Generator(nn.Module):
         _, _, feats = self.encode(x, cond)
         return feats
 
-    def decode(self, x: torch.Tensor, skips: list[torch.Tensor], mod: torch.Tensor) -> torch.Tensor:
+    def decode(
+        self,
+        x: torch.Tensor,
+        skips: list[torch.Tensor],
+        mod: torch.Tensor,
+        return_preskip: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[int, torch.Tensor]]:
+        """Decode. Pre-skip maps are the upsampled tensors before each skip join.
+
+        Keys 4, 3, 2, 1 match encoder feature indices on a 512 tile.
+        """
         s0, s1, s2, s3 = skips
-        x = self.dec3(torch.cat((self.up3(x), s3), dim=1), mod)
-        x = self.dec2(torch.cat((self.up2(x), s2), dim=1), mod)
-        x = self.dec1(torch.cat((self.up1(x), s1), dim=1), mod)
-        x = self.dec0(torch.cat((self.up0(x), s0), dim=1), mod)
-        return torch.tanh(self.head(x))
+        preskip: dict[int, torch.Tensor] = {}
+        up = self.up3(x)
+        preskip[4] = up
+        x = self.dec3(torch.cat((up, s3), dim=1), mod)
+        up = self.up2(x)
+        preskip[3] = up
+        x = self.dec2(torch.cat((up, s2), dim=1), mod)
+        up = self.up1(x)
+        preskip[2] = up
+        x = self.dec1(torch.cat((up, s1), dim=1), mod)
+        up = self.up0(x)
+        preskip[1] = up
+        x = self.dec0(torch.cat((up, s0), dim=1), mod)
+        image = torch.tanh(self.head(x))
+        if return_preskip:
+            return image, preskip
+        return image
 
     def forward(
         self,
@@ -472,6 +494,7 @@ class Generator(nn.Module):
         black_index: torch.Tensor | None = None,
         return_aux: bool = False,
         quadrant_group: int = 4,
+        return_preskip: bool = False,
     ) -> torch.Tensor | tuple:
         self._check(x, collage)
         aux = None
@@ -488,9 +511,17 @@ class Generator(nn.Module):
         hidden, skips, feats = self.encode(x, cond)
         local_memory = None if local is None else self._local_memory(local, x.shape[0])
         hidden, mod = self.bottleneck(hidden, memory, local_memory, memory_mask)
-        image = self.decode(hidden, skips, mod)
+        if return_preskip:
+            image, preskip = self.decode(hidden, skips, mod, return_preskip=True)
+        else:
+            image = self.decode(hidden, skips, mod)
+            preskip = None
         if return_aux:
             return image, aux
+        if return_preskip and return_cond:
+            return image, cond, feats, preskip
+        if return_preskip:
+            return image, feats, preskip
         if return_features and return_cond:
             return image, feats, cond
         if return_cond:

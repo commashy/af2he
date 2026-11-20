@@ -28,7 +28,8 @@ from torch.utils.data.distributed import DistributedSampler
 from data.retrieval_table import RetrievalTable
 from data.stage1 import Stage1Dataset, collate_stage1, seam_windows, stitch_quadrants
 from engine.checkpoint import unwrap
-from engine.contrastive import DebiasedPatchNCESRC, field_info_nce, patch_nce, retrieval_pair_weight
+from engine.contrastive import field_info_nce, patch_nce, retrieval_pair_weight
+from engine.enco_lsesim import EnCoLSeSimLoss
 from engine.distributed import cleanup, is_main, setup
 from engine.monitor import Monitor
 from engine.image_losses import (
@@ -62,7 +63,7 @@ from models.discriminator import (
 from models.field_critic import ConchFieldDiscriminator, multilevel_bce
 from models.generator import BOTTLENECK_DIM, FEATURE_CHANNELS, Generator, resize_collage_positions
 from models.heat_classifier import HeatClassifier
-from models.sample import DomainAdaptedPatchProjector, PatchProjector
+from models.sample import PatchProjector
 from models.slide_head import SlideDiagnosisHead
 from models.wsi_collage_encoder import WSICollageAdapter
 
@@ -196,25 +197,6 @@ def _one_per_field(tensor: torch.Tensor | None, n_fields: int) -> torch.Tensor |
     if tensor.shape[0] == n_fields * 4:
         return tensor[::4]
     raise RuntimeError(f"{tensor.shape[0]} rows for {n_fields} fields")
-
-
-def _sample_paired_patches(
-    query_feats: list[torch.Tensor],
-    key_feats: list[torch.Tensor],
-    num_patches: int,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Same spatial sites in both domains. The key is detached."""
-    query_out = []
-    key_out = []
-    for query, key in zip(query_feats, key_feats):
-        if query.shape[-2:] != key.shape[-2:]:
-            raise RuntimeError(f"patch grids {tuple(query.shape[-2:])} and {tuple(key.shape[-2:])}")
-        _batch, _channels, height, width = key.shape
-        count = min(int(num_patches), height * width)
-        choice = torch.randperm(height * width, device=key.device)[:count]
-        key_out.append(key.detach().flatten(2).transpose(1, 2)[:, choice, :])
-        query_out.append(query.flatten(2).transpose(1, 2)[:, choice, :])
-    return query_out, key_out
 
 
 def _maps(feats: list[torch.Tensor], layers: list[int]) -> list[torch.Tensor]:
@@ -586,20 +568,18 @@ def main() -> None:
         heat_net.eval()
         for parameter in heat_net.parameters():
             parameter.requires_grad_(False)
-    domain_nce = bool(config.get("nce_domain_adapter", False)) and use_nce
-    if domain_nce:
-        projector = DomainAdaptedPatchProjector(channels).to(device)
-        nce_relation = DebiasedPatchNCESRC(
-            tau_nce=float(config["nce_T"]),
-            fn_thresh=float(config.get("nce_fn_thresh", 0.80)),
-            fn_temp=float(config.get("nce_fn_temp", 0.05)),
-            use_src=float(config.get("nce_src", 0.5)) > 0,
-            tau_src=float(config.get("nce_src_T", 1.0)),
-            lambda_src=float(config.get("nce_src", 0.5)),
-        )
+    use_lsesim = config.get("nce_mode") == "enco_lsesim" and use_nce
+    if use_lsesim:
+        projector = EnCoLSeSimLoss(
+            num_layers=len(layers),
+            kernel_size=int(config.get("lsesim_kernel", 7)),
+            dilation=int(config.get("lsesim_dilation", 1)),
+            hidden_dim=int(config.get("lsesim_hidden", 128)),
+            tau=float(config["nce_T"]),
+            fg_ratio=float(config.get("lsesim_fg_ratio", 0.85)),
+        ).to(device)
     else:
         projector = PatchProjector(channels).to(device) if use_nce else None
-        nce_relation = None
     fdl = AmplitudeFDL(
         num_proj=int(config["fdl_num_proj"]),
         input_size=int(config["fdl_input_size"]),
@@ -694,9 +674,7 @@ def main() -> None:
         _freeze_wsi_encoder(generator)
     trainable = [parameter for parameter in generator.parameters() if parameter.requires_grad]
     generator_groups = [{"params": trainable, "lr": float(config["lr_G"])}]
-    if isinstance(projector, DomainAdaptedPatchProjector):
-        generator_groups.extend(projector.param_groups(float(config["lr_F"])))
-    elif projector is not None:
+    if projector is not None:
         generator_groups.append({"params": projector.parameters(), "lr": float(config["lr_F"])})
     saved_generator_groups = (
         len(payload["optimizer_g"]["param_groups"]) if payload is not None else len(generator_groups)
@@ -997,8 +975,19 @@ def main() -> None:
             seam_targets = _seam_targets(raw_g, af, collage, device, local, cells, black) if use_overlap else None
             conditioning = {} if cells is None else {"cells": cells, "black_index": black}
 
+            enc_feats = None
+            preskip = None
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                if use_mb:
+                if use_lsesim and use_mb:
+                    fake, cond, enc_feats, preskip = generator(
+                        af, collage, local, return_cond=True, return_preskip=True, **conditioning,
+                    )
+                elif use_lsesim:
+                    fake, enc_feats, preskip = generator(
+                        af, collage, local, return_preskip=True, **conditioning,
+                    )
+                    cond = None
+                elif use_mb:
                     fake, cond = generator(af, collage, local, return_cond=True, **conditioning)
                 else:
                     fake = generator(af, collage, local, **conditioning)
@@ -1162,8 +1151,16 @@ def main() -> None:
                 )
             fake_feats = None
             af_feats = None
-            nce_neg_weight = None
-            if use_nce:
+            if use_lsesim:
+                selected_enc = [enc_feats[layer] for layer in layers]
+                selected_dec = [preskip[layer] for layer in layers]
+                tissue = hed_tissue_mask(epoch10_out) if epoch10_out is not None else None
+                nce = projector(
+                    selected_enc, selected_dec, int(config["num_patches"]), tissue,
+                )
+                scaled["nce"] = _weight(config, "lambda_NCE") * nce
+                del enc_feats, preskip, selected_enc, selected_dec
+            elif use_nce:
                 # One 1024 field, not four 512 crops. The query carries grad
                 # through the stitch. The AF key is detached, as in CUT.
                 # Encode on the unwrapped module. Generate already ran those
@@ -1190,43 +1187,19 @@ def main() -> None:
                     )
                 with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     af_feats = _encode_field(af_field)
-                if domain_nce:
-                    raw_he, raw_af = _sample_paired_patches(
-                        fake_feats, af_feats, int(config["num_patches"]),
-                    )
-                    projected_he = projector(raw_he, "he")
-                    projected_af = projector(raw_af, "af")
-                    nce_terms = []
-                    src_terms = []
-                    weight_terms = []
-                    for query, key, raw_key in zip(projected_he, projected_af, raw_af):
-                        nce_term, src_term, neg_weight = nce_relation(query, key, raw_key)
-                        nce_terms.append(nce_term)
-                        src_terms.append(src_term)
-                        weight_terms.append(neg_weight)
-                    nce = torch.stack(nce_terms).mean()
-                    src = torch.stack(src_terms).mean()
-                    nce_neg_weight = float(torch.stack(weight_terms).mean())
-                    contrast_weight = _weight(config, "lambda_NCE")
-                    scaled["nce"] = contrast_weight * nce
-                    scaled["src"] = contrast_weight * src
-                    del raw_he, raw_af, projected_he, projected_af
-                else:
-                    query, source_key = projector(
-                        [fake_feats, af_feats],
-                        int(config["num_patches"]),
-                    )
-                    nce = _contrast(
-                        query, source_key,
-                        # One bank per 1024 field. The current batch is one field, so this is 1.
-                        lambda left, right: patch_nce(
-                            left, right, fake_field.shape[0], float(config["nce_T"]),
-                        ),
-                    )
-                    nce_neg_weight = None
-                    scaled["nce"] = _weight(config, "lambda_NCE") * nce
-                    del query, source_key
-                del fake_feats, af_feats, af_field
+                query, source_key = projector(
+                    [fake_feats, af_feats],
+                    int(config["num_patches"]),
+                )
+                nce = _contrast(
+                    query, source_key,
+                    # One bank per 1024 field. The current batch is one field, so this is 1.
+                    lambda left, right: patch_nce(
+                        left, right, fake_field.shape[0], float(config["nce_T"]),
+                    ),
+                )
+                scaled["nce"] = _weight(config, "lambda_NCE") * nce
+                del query, source_key, fake_feats, af_feats, af_field
             if use_fdl:
                 if epoch10_out is not None:
                     aligned = stitch_quadrants(epoch10_out)
@@ -1440,9 +1413,6 @@ def main() -> None:
                 if heat_keep is not None:
                     extras += f" heat_w={heat_keep:.3f}"
                     record["loss/heat_w"] = heat_keep
-                if nce_neg_weight is not None:
-                    extras += f" nce_w={nce_neg_weight:.3f}"
-                    record["loss/nce_w"] = nce_neg_weight
                 if field_weight is not None:
                     extras += f" field_w={float(field_weight.mean()):.3f}"
                     record["loss/field_w"] = float(field_weight.mean())
