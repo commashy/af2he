@@ -14,6 +14,7 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 from data.dataset import (
     SOURCE,
@@ -81,6 +82,70 @@ def exclusion_keys(path: str | None) -> set[str]:
 
 def is_excluded(slide: str, keys: set[str]) -> bool:
     return slide in keys or _specimen(slide) in keys
+
+
+def slide_keys_from_names(folder: str) -> set[str]:
+    """Specimen ids from filenames such as ``F25-06301-1-AF-R1.jpg``."""
+    root = Path(folder)
+    if not root.is_dir():
+        raise FileNotFoundError(f"slide list folder does not exist: {root}")
+    keys = set()
+    for path in root.iterdir():
+        if not path.is_file():
+            continue
+        stem = path.stem
+        keys.add(stem.split("-AF", 1)[0] if "-AF" in stem else stem)
+    if not keys:
+        raise RuntimeError(f"no slide names in {root}")
+    return keys
+
+
+def lead_sample_indices(dataset: "Stage1Dataset", keys: set[str]) -> tuple[list[int], set[str]]:
+    """Training fields whose specimen id is in ``keys``."""
+    indices = []
+    slides = set()
+    for index, sample in enumerate(dataset.samples):
+        slide = sample[0].name.split("__", 1)[0]
+        if _specimen(slide) in keys:
+            indices.append(index)
+            slides.add(slide)
+    return indices, slides
+
+
+class LeadSlidesSampler(DistributedSampler):
+    """Epoch 0 walks the lead fields first. Later epochs shuffle everything."""
+
+    def __init__(self, dataset, lead_indices: list[int], num_replicas: int, rank: int, seed: int = 0):
+        super().__init__(
+            dataset,
+            num_replicas=int(num_replicas),
+            rank=int(rank),
+            shuffle=True,
+            seed=int(seed),
+            drop_last=False,
+        )
+        lead = {int(index) for index in lead_indices}
+        self.lead_indices = [index for index in range(len(dataset)) if index in lead]
+        self.other_indices = [index for index in range(len(dataset)) if index not in lead]
+
+    def __iter__(self):
+        if self.epoch != 0 or not self.lead_indices:
+            return super().__iter__()
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        lead = torch.tensor(self.lead_indices)
+        other = torch.tensor(self.other_indices)
+        lead = lead[torch.randperm(lead.numel(), generator=generator)].tolist()
+        if other.numel():
+            other = other[torch.randperm(other.numel(), generator=generator)].tolist()
+        else:
+            other = []
+        indices = lead + other
+        if len(indices) < self.total_size:
+            indices += indices[: self.total_size - len(indices)]
+        else:
+            indices = indices[: self.total_size]
+        return iter(indices[self.rank : self.total_size : self.num_replicas])
 
 
 class Stage1Dataset(Dataset):

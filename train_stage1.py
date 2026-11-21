@@ -26,10 +26,18 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from data.retrieval_table import RetrievalTable
-from data.stage1 import Stage1Dataset, collate_stage1, seam_windows, stitch_quadrants
+from data.stage1 import (
+    LeadSlidesSampler,
+    Stage1Dataset,
+    collate_stage1,
+    lead_sample_indices,
+    seam_windows,
+    slide_keys_from_names,
+    stitch_quadrants,
+)
 from engine.checkpoint import unwrap
 from engine.contrastive import field_info_nce, patch_nce, retrieval_pair_weight
-from engine.enco_lsesim import EnCoLSeSimLoss
+from engine.enco_lsesim import EnCoFSeSimLoss
 from engine.distributed import cleanup, is_main, setup
 from engine.monitor import Monitor
 from engine.image_losses import (
@@ -523,7 +531,22 @@ def main() -> None:
         collage_root=config.get("collage_root"),
         heat_targets=load_heat_targets(config.get("heat_targets")),
     )
-    sampler = DistributedSampler(dataset, shuffle=True) if ctx.distributed else None
+    lead_root = config.get("epoch1_first_slides")
+    if lead_root:
+        lead_indices, lead_slides = lead_sample_indices(dataset, slide_keys_from_names(lead_root))
+        if not lead_indices:
+            raise RuntimeError(f"no training fields match the slides in {lead_root}")
+        sampler = LeadSlidesSampler(
+            dataset, lead_indices, num_replicas=ctx.world_size, rank=ctx.rank, seed=int(config["seed"]),
+        )
+        if is_main(ctx):
+            print(
+                f"epoch 1 leads with {len(lead_slides)} slides, {len(lead_indices)} fields, "
+                f"then {len(dataset) - len(lead_indices)} other fields",
+                flush=True,
+            )
+    else:
+        sampler = DistributedSampler(dataset, shuffle=True) if ctx.distributed else None
     loader = DataLoader(
         dataset,
         batch_size=image_batch // 4,
@@ -568,15 +591,19 @@ def main() -> None:
         heat_net.eval()
         for parameter in heat_net.parameters():
             parameter.requires_grad_(False)
-    use_lsesim = config.get("nce_mode") == "enco_lsesim" and use_nce
+    nce_mode = config.get("nce_mode")
+    if nce_mode == "enco_lsesim":
+        raise RuntimeError("nce_mode enco_lsesim trained a lookup, not the neighborhood; use enco_fsesim")
+    use_lsesim = nce_mode == "enco_fsesim" and use_nce
     if use_lsesim:
-        projector = EnCoLSeSimLoss(
-            num_layers=len(layers),
+        dilations = [int(value) for value in config.get("lsesim_dilations", [1, 2])]
+        if len(dilations) != len(layers):
+            raise ValueError(f"lsesim_dilations {dilations} does not match nce_layers {layers}")
+        projector = EnCoFSeSimLoss(
+            dilations=dilations,
             kernel_size=int(config.get("lsesim_kernel", 7)),
-            dilation=int(config.get("lsesim_dilation", 1)),
-            hidden_dim=int(config.get("lsesim_hidden", 128)),
-            tau=float(config["nce_T"]),
             fg_ratio=float(config.get("lsesim_fg_ratio", 0.85)),
+            flat_norm=float(config.get("lsesim_flat_norm", 0.05)),
         ).to(device)
     else:
         projector = PatchProjector(channels).to(device) if use_nce else None
@@ -591,7 +618,7 @@ def main() -> None:
     if args.resume:
         payload = torch.load(args.resume, map_location=device, weights_only=False)
         load_generator_weights(generator, payload["generator"])
-        if projector is not None:
+        if projector is not None and any(unwrap(projector).parameters()):
             unwrap(projector).load_state_dict(payload["projector"])
     d_slide = bool(config.get("d_slide_cond", False)) and use_gan
     d_cls = bool(config.get("d_slide_cls", False)) and use_gan
@@ -674,8 +701,9 @@ def main() -> None:
         _freeze_wsi_encoder(generator)
     trainable = [parameter for parameter in generator.parameters() if parameter.requires_grad]
     generator_groups = [{"params": trainable, "lr": float(config["lr_G"])}]
-    if projector is not None:
-        generator_groups.append({"params": projector.parameters(), "lr": float(config["lr_F"])})
+    projector_parameters = [parameter for parameter in projector.parameters() if parameter.requires_grad] if projector is not None else []
+    if projector_parameters:
+        generator_groups.append({"params": projector_parameters, "lr": float(config["lr_F"])})
     saved_generator_groups = (
         len(payload["optimizer_g"]["param_groups"]) if payload is not None else len(generator_groups)
     )
@@ -780,7 +808,7 @@ def main() -> None:
             discriminator = DistributedDataParallel(discriminator, device_ids=[ctx.local_rank])
         if field_d is not None:
             field_d = DistributedDataParallel(field_d, device_ids=[ctx.local_rank])
-        if projector is not None:
+        if projector_parameters:
             projector = DistributedDataParallel(projector, device_ids=[ctx.local_rank])
     raw_g = unwrap(generator)
     teacher_on_disk = bool(config.get("teacher_dir")) and bool(config.get("load_teacher", True))
@@ -847,6 +875,13 @@ def main() -> None:
                 if unwrap(generator).local_encoder is not None else ""
             )
         )
+        if use_lsesim:
+            print(
+                f"structure: 1-cos local self-similarity layers={layers} "
+                f"dilations={list(unwrap(projector).dilations)} "
+                f"lambda={_weight(config, 'lambda_NCE'):g}",
+                flush=True,
+            )
         monitor.open(config)
 
     n_epochs = int(config["n_epochs"])

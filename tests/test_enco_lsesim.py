@@ -1,4 +1,4 @@
-"""Local self-similarity loss and the pre-skip decoder tap."""
+"""Local self-similarity distance and the pre-skip decoder tap."""
 
 from __future__ import annotations
 
@@ -11,30 +11,52 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from engine.enco_lsesim import EnCoLSeSimLoss
+from engine.enco_lsesim import EnCoFSeSimLoss
 from models.generator import Generator
 
 
-def test_uniform_neighborhood_is_identical() -> None:
-    loss = EnCoLSeSimLoss(num_layers=1, kernel_size=7)
-    feat = torch.ones(1, 4, 8, 8)
-    y = torch.tensor([[3]])
-    x = torch.tensor([[4]])
-    sim = loss._local_self_sim(feat, y, x)
-    if sim.shape != (1, 1, 48):
-        raise AssertionError(tuple(sim.shape))
-    if not torch.allclose(sim, torch.ones_like(sim), atol=1e-5):
-        raise AssertionError(float(sim.min()))
+def test_module_has_no_parameters() -> None:
+    loss = EnCoFSeSimLoss(dilations=(1, 2))
+    if any(loss.parameters()):
+        raise AssertionError("structure loss should not own parameters")
 
 
-def test_matching_maps_score_below_a_mismatch() -> None:
+def test_uniform_encoder_is_left_out() -> None:
+    loss = EnCoFSeSimLoss(dilations=(1,), kernel_size=7)
+    enc = torch.ones(1, 4, 8, 8)
+    dec = torch.randn(1, 4, 8, 8)
+    value = loss([enc], [dec], num_patches=4)
+    if float(value) != 0.0:
+        raise AssertionError(float(value))
+
+
+def test_identical_and_rescaled_maps_match() -> None:
     torch.manual_seed(0)
-    loss = EnCoLSeSimLoss(num_layers=1, kernel_size=3, hidden_dim=16, fg_ratio=0.5)
+    loss = EnCoFSeSimLoss(dilations=(1,), kernel_size=3, fg_ratio=0.5)
     enc = torch.randn(2, 8, 12, 12)
-    matched = loss([enc], [enc.clone()], num_patches=6)
+    same = loss([enc], [enc * 4 + 0.7], num_patches=6)
     other = loss([enc], [torch.randn_like(enc)], num_patches=6)
-    if float(matched) >= float(other):
-        raise AssertionError(f"matched {float(matched)} other {float(other)}")
+    if float(same) > 1e-4:
+        raise AssertionError(f"rescaled match {float(same)}")
+    if float(same) >= float(other):
+        raise AssertionError(f"matched {float(same)} other {float(other)}")
+
+
+def test_mismatched_decoder_has_a_finite_gradient() -> None:
+    torch.manual_seed(0)
+    loss = EnCoFSeSimLoss(dilations=(2,), kernel_size=7, flat_norm=0.05)
+    enc = torch.randn(1, 8, 16, 16)
+    dec = torch.randn(1, 8, 16, 16, requires_grad=True)
+    value = loss([enc], [dec], num_patches=8)
+    if not (0.2 < float(value) <= 2.0):
+        raise AssertionError(float(value))
+    value.backward()
+    if dec.grad is None or not torch.isfinite(dec.grad).all():
+        raise AssertionError("gradient missing or non-finite")
+    if float(dec.grad.abs().max()) > 5:
+        raise AssertionError(float(dec.grad.abs().max()))
+    if float(dec.grad.abs().sum()) == 0:
+        raise AssertionError("decoder received no gradient")
 
 
 def test_preskip_matches_encoder_grid_and_trains_the_decoder() -> None:
@@ -56,7 +78,9 @@ def test_preskip_matches_encoder_grid_and_trains_the_decoder() -> None:
 
 
 if __name__ == "__main__":
-    test_uniform_neighborhood_is_identical()
-    test_matching_maps_score_below_a_mismatch()
+    test_module_has_no_parameters()
+    test_uniform_encoder_is_left_out()
+    test_identical_and_rescaled_maps_match()
+    test_mismatched_decoder_has_a_finite_gradient()
     test_preskip_matches_encoder_grid_and_trains_the_decoder()
     print("ok")

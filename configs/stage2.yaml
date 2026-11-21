@@ -8,6 +8,8 @@ he_root: /mnt/10tb_hdd/taek/images/Fresh_section/patches_1024/trainB
 alignment: /mnt/10tb_hdd/taek/af2he/manifests/pseudo_alignment.csv
 exclude_slides: /mnt/10tb_hdd/taek/stain_translation_enco/configs/exclude_fresh_poor_pairs.txt
 extra_slides: /mnt/10tb_hdd/taek/af2he/expand/slides.txt
+# Epoch 1 walks these slides before the rest of the training set.
+epoch1_first_slides: /mnt/10tb_hdd/taek/images/202610_inference_training_set
 collage_index: /mnt/10tb_hdd/taek/af2he/collages/index.json
 collage_size: 1024
 pretrain_checkpoint: /mnt/10tb_hdd/taek/af2he/checkpoints/pretrain/last.pt
@@ -47,18 +49,19 @@ wandb_project: af2he
 lambda_mb: 0.1
 slide_labels: /mnt/10tb_hdd/taek/stain_translation_core/manifests/fresh/train_slide_labels.csv
 
-# Local self-similarity between the AF encoder and the pre-skip decoder.
-lambda_NCE: 0.2
+# Cosine distance between AF-encoder and pre-skip neighborhood vectors.
+lambda_NCE: 1.0
 # AF gray >= 0.60 must keep light stain. The penalty stops at optical density 0.35.
 lambda_keep: 1.0
 nce_T: 0.07
-nce_layers: [2, 3, 4]
+nce_layers: [3, 4]
 num_patches: 256
-nce_mode: enco_lsesim
+nce_mode: enco_fsesim
 lsesim_kernel: 7
-lsesim_dilation: 1
-lsesim_hidden: 128
+# Layer 3 is 128×128 (about 28 px). Layer 4 is 64×64, dilated to about 104 px.
+lsesim_dilations: [1, 2]
 lsesim_fg_ratio: 0.85
+lsesim_flat_norm: 0.05
 
 lambda_GAN: 1.0
 netD_num_scales: 4
